@@ -38,13 +38,36 @@ DO_FIREFOX=1
 DO_PREFS=1
 DO_LAUNCHER=1
 
+# Kept inline (not `sed` over $0) so --help works when the script is piped,
+# e.g. curl -fsSL <url> | bash -s -- --help
+usage() {
+  cat <<'USAGE'
+fix-termux-ubuntu.sh -- fix DNS and Firefox inside the 'ubuntu' proot container
+
+Usage:
+  bash fix-termux-ubuntu.sh
+  bash fix-termux-ubuntu.sh --skip-dns --skip-firefox   # prefs + launcher only
+  DISTRO=ubuntu bash fix-termux-ubuntu.sh
+  DNS1=9.9.9.9 DNS2=149.112.112.112 bash fix-termux-ubuntu.sh
+
+Options:
+  --skip-dns        do not touch /etc/resolv.conf
+  --skip-firefox    do not download/reinstall Firefox (~90 MB)
+  --skip-prefs      do not write user.js into the Firefox profile(s)
+  --skip-launcher   do not rewrite the desktop/menu entries
+  -h, --help        show this help
+
+Env: DISTRO (default ubuntu), DNS1 (1.1.1.1), DNS2 (8.8.8.8)
+USAGE
+}
+
 for arg in "$@"; do
   case "$arg" in
     --skip-dns)      DO_DNS=0 ;;
     --skip-firefox)  DO_FIREFOX=0 ;;
     --skip-prefs)    DO_PREFS=0 ;;
     --skip-launcher) DO_LAUNCHER=0 ;;
-    -h|--help)       sed -n '2,26p' "$0"; exit 0 ;;
+    -h|--help)       usage; exit 0 ;;
     *) printf 'Unknown option: %s (try --help)\n' "$arg" >&2; exit 2 ;;
   esac
 done
