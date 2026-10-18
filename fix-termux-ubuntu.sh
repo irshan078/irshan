@@ -18,6 +18,9 @@
 # be done through `proot-distro login`, so proot-distro layout changes
 # (v4 vs v5, containers/ vs installed-rootfs/) do not matter.
 #
+# It also works when run *inside* the container (e.g. from the XFCE terminal),
+# where proot-distro is not usable: it then edits the container directly.
+#
 # Usage:
 #   bash fix-termux-ubuntu.sh
 #   DISTRO=ubuntu bash fix-termux-ubuntu.sh
@@ -57,7 +60,8 @@ Options:
   --skip-launcher   do not rewrite the desktop/menu entries
   -h, --help        show this help
 
-Env: DISTRO (default ubuntu), DNS1 (1.1.1.1), DNS2 (8.8.8.8)
+Env: DISTRO (default ubuntu), DNS1 (1.1.1.1), DNS2 (8.8.8.8),
+     LOCAL_MODE (1 = inside the container, 0 = in Termux; auto-detected)
 USAGE
 }
 
@@ -78,19 +82,56 @@ warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- preflight --
-[ -d "$PREFIX" ] || die "This must run inside Termux, not inside proot-distro."
-command -v proot-distro >/dev/null 2>&1 || die "proot-distro missing: pkg install proot-distro"
+# Termux has no /etc/os-release (Android keeps its own under /system/etc), the
+# proot container does. Running this from the desktop terminal must work too:
+# it is the very place where "my tab crashed" shows up.
+inside_container() {
+  if [ -f /etc/os-release ] \
+     && grep -qiE '^(ID|ID_LIKE)=.*(ubuntu|debian|kali|linuxmint|fedora|arch|alpine)' /etc/os-release 2>/dev/null; then
+    return 0
+  fi
+  [ -d /etc/apt ] && command -v dpkg >/dev/null 2>&1 && return 0
+  return 1
+}
+
+if [ -z "${LOCAL_MODE:-}" ]; then
+  # LOCAL_MODE=1/0 forces the mode; the default is the detection above.
+  if inside_container; then LOCAL_MODE=1; else LOCAL_MODE=0; fi
+fi
+
+if [ "$LOCAL_MODE" = 1 ]; then
+  ok "Running inside the container: no proot-distro needed, changing things directly."
+else
+  [ -d "$PREFIX" ] || die "This must run inside Termux, not inside proot-distro."
+  command -v proot-distro >/dev/null 2>&1 || die "proot-distro missing: pkg install proot-distro"
+fi
 
 # proot-distro prints a login banner on stdout; keep only the last real line.
-in_distro() {
-  proot-distro login "$DISTRO" -- /bin/bash -lc "$1" 2>&1
-}
-in_distro_q() {
-  proot-distro login "$DISTRO" -- /bin/bash -lc "$1" >/dev/null 2>&1
-}
+if [ "$LOCAL_MODE" = 1 ]; then
+  in_distro()      { bash -c "$1" 2>&1; }
+  in_distro_q()    { bash -c "$1" >/dev/null 2>&1; }
+else
+  in_distro() {
+    proot-distro login "$DISTRO" -- /bin/bash -lc "$1" 2>&1
+  }
+  in_distro_q() {
+    proot-distro login "$DISTRO" -- /bin/bash -lc "$1" >/dev/null 2>&1
+  }
+fi
 in_distro_last() {
   in_distro "$1" | tr -d '\r' | awk 'NF { last = $0 } END { if (last != "") print last }'
 }
+
+# The home directory *inside* the container (/root usually). Cached so the
+# summary does not need an extra login round trip.
+container_home() {
+  if [ -z "$CONTAINER_HOME" ]; then
+    CONTAINER_HOME="$(in_distro_last 'printf %s "$HOME"')"
+    [ -n "$CONTAINER_HOME" ] || CONTAINER_HOME="$HOME"
+  fi
+  printf '%s' "$CONTAINER_HOME"
+}
+CONTAINER_HOME=""
 
 # Push a file into the container over stdin-friendly base64, so no host-side
 # rootfs path is needed and no nested quoting can break.
@@ -139,17 +180,24 @@ find_rootfs() {
   return 1
 }
 
-log "Looking for the '$DISTRO' proot rootfs on the host..."
-if ROOTFS="$(find_rootfs)"; then
-  ok "Rootfs: $ROOTFS"
-else
+if [ "$LOCAL_MODE" = 1 ]; then
+  # Already inside: host-side writes are unnecessary (and would be wrong).
   ROOTFS=""
-  warn "Rootfs path not found on the host (new proot-distro layout?)."
-  warn "That is fine: DNS and the launcher will be written from inside the container."
-fi
+else
+  log "Looking for the '$DISTRO' proot rootfs on the host..."
+  if ROOTFS="$(find_rootfs)"; then
+    ok "Rootfs: $ROOTFS"
+  else
+    ROOTFS=""
+    warn "Rootfs path not found on the host (new proot-distro layout?)."
+    warn "That is fine: DNS and the launcher will be written from inside the container."
+  fi
 
-proot-distro login "$DISTRO" -- true >/dev/null 2>&1 \
-  || die "'proot-distro login $DISTRO' fails. Fix that first (proot-distro install $DISTRO)."
+  # `/proc/sys/kernel/random/*` errors above come from proot itself and are
+  # harmless; what matters is whether the login actually works.
+  proot-distro login "$DISTRO" -- true >/dev/null 2>&1 || die \
+    "'proot-distro login $DISTRO' fails. If you are already *inside* the container, run this script there instead (it edits the container directly). Otherwise: proot-distro install $DISTRO."
+fi
 
 # --------------------------------------------------------------------- DNS ---
 fix_dns() {
@@ -220,7 +268,7 @@ install_firefox() {
   local home arch url pkg missing=()
   local ffbin
 
-  home="$(in_distro_last 'printf %s "$HOME"')"
+  home="$(container_home)"
   [ -n "$home" ] || home="/root"
   arch="$(in_distro_last 'uname -m')"
 
@@ -231,6 +279,7 @@ install_firefox() {
   esac
 
   log "Installing Firefox for $arch into $home/$FF_HOME_DIR"
+  [ "$LOCAL_MODE" = 1 ] && log "(inside the container: no proot-distro round trips)"
   in_distro_q 'apt-get update -qq' || warn "apt-get update failed (DNS not fixed yet? continuing anyway)"
 
   # Package names differ between Ubuntu releases (libasound2 vs libasound2t64),
@@ -299,7 +348,7 @@ EOF
     rm -f "$src"
     return
   fi
-  in_distro_q 'for p in "$HOME"/.mozilla/firefox/*/; do [ -d "$p" ] && cp -f /tmp/ff-user.js "$p/user.js"; done; rm -f /tmp/ff-user.js'
+  in_distro_q 'for p in "$HOME"/.mozilla/firefox/*/; do [ -d "$p" ] && cp -f /tmp/ff-user.js "$p/user.js" && chmod 644 "$p/user.js"; done; rm -f /tmp/ff-user.js'
 
   n="$(in_distro_last 'ls -d "$HOME"/.mozilla/firefox/*/ 2>/dev/null | wc -l')"
   n="${n//[^0-9]/}"
@@ -317,8 +366,7 @@ EOF
 write_launcher() {
   local home desk icon src
 
-  home="$(in_distro_last 'printf %s "$HOME"')"
-  [ -n "$home" ] || home="/root"
+  home="$(container_home)"
   desk="$(in_distro_last 'command -v xdg-user-dir >/dev/null 2>&1 && xdg-user-dir DESKTOP || printf %s "$HOME/Desktop"')"
   [ -n "$desk" ] || desk="$home/Desktop"
 
@@ -326,9 +374,10 @@ write_launcher() {
 
   # Decide the icon before writing the file; older builds may lack it.
   icon="$home/$FF_HOME_DIR/browser/chrome/icons/default/default128.png"
-  if [ -n "$ROOTFS" ] && [ ! -f "$ROOTFS$icon" ]; then
-    warn "Icon file missing; the launcher will use the theme's generic icon."
-    icon="firefox"
+  if [ -n "$ROOTFS" ]; then
+    [ -f "$ROOTFS$icon" ] || { warn "Icon file missing; using the theme's generic icon."; icon="firefox"; }
+  elif [ "$LOCAL_MODE" = 1 ]; then
+    [ -f "$icon" ] || { warn "Icon file missing; using the theme's generic icon."; icon="firefox"; }
   fi
 
   src="$(mktemp)" || die "mktemp failed"
@@ -369,6 +418,22 @@ EOF
     warn "Could not write the launcher into $DISTRO."
   fi
   rm -f "$src"
+
+  # Same environment as the launcher, for people who start Firefox from a
+  # terminal (`~/firefox/firefox` on its own crashes the first tab).
+  src="$(mktemp)" || die "mktemp failed"
+  cat > "$src" <<EOF
+#!/bin/sh
+# Written by fix-termux-ubuntu.sh -- run THIS instead of ~/firefox/firefox.
+export $SANDBOX_ENV
+exec $home/$FF_HOME_DIR/firefox "\$@"
+EOF
+  if push_into_distro "$home/start-firefox.sh" "$src"; then
+    ok "Wrote $home/start-firefox.sh (terminal-friendly starter)"
+  else
+    warn "Could not write $home/start-firefox.sh."
+  fi
+  rm -f "$src"
 }
 
 if [ "$DO_PREFS" = 1 ]; then
@@ -383,7 +448,14 @@ fi
 echo
 ok "Done. Next steps:"
 printf '  - If the desktop is open, right-click the new Firefox icon -> "Allow launching" (XFCE asks once).\n'
-printf '  - Start Firefox from the icon (not a bare terminal call) so the sandbox-off env vars apply.\n'
+FINAL_HOME="$(container_home)"
+printf '  - Start Firefox from the icon, or from a terminal with  %s/start-firefox.sh\n' "$FINAL_HOME"
+printf '    (a bare %s/%s/firefox call has no sandbox-off env and crashes the first tab).\n' "$FINAL_HOME" "$FF_HOME_DIR"
 printf '  - Restart the VNC session so menu/icon caches are rebuilt, e.g.:\n'
 printf '        vncserver -kill :1 && vncserver :1 -geometry 1280x720 -depth 24\n'
-printf '  - Sanity check inside the container:  proot-distro login %s -- ping -c2 google.com\n' "$DISTRO"
+if [ "$LOCAL_MODE" = 1 ]; then
+  printf '  - Sanity check:  ping -c2 google.com\n'
+  printf '  - This run happened inside the container, so DNS/Firefox were left alone only if you passed --skip-*.\n'
+else
+  printf '  - Sanity check inside the container:  proot-distro login %s -- ping -c2 google.com\n' "$DISTRO"
+fi
