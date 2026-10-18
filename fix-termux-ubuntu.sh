@@ -11,6 +11,8 @@
 #      /<home>/firefox, because Ubuntu's snap-based firefox cannot work in proot.
 #   3. Regenerates the XFCE launcher (desktop icon + applications menu entry)
 #      pointing at that binary with the sandbox-disabled environment.
+#   4. Writes user.js sandbox prefs into every Firefox profile, so tabs stop
+#      dying with "Gah. Your tab just crashed." (proot cannot run seccomp).
 #
 # It works whether or not the rootfs can be found on the host: everything can
 # be done through `proot-distro login`, so proot-distro layout changes
@@ -20,7 +22,8 @@
 #   bash fix-termux-ubuntu.sh
 #   DISTRO=ubuntu bash fix-termux-ubuntu.sh
 #   DNS1=9.9.9.9 DNS2=149.112.112.112 bash fix-termux-ubuntu.sh
-#   bash fix-termux-ubuntu.sh --skip-dns --skip-firefox   # only launcher, etc.
+#   bash fix-termux-ubuntu.sh --skip-dns --skip-firefox   # prefs + launcher only
+#   bash fix-termux-ubuntu.sh --skip-prefs                # keep the existing prefs
 #
 set -uo pipefail
 
@@ -32,14 +35,16 @@ FF_HOME_DIR="firefox"          # final path is <home-inside-proot>/firefox
 
 DO_DNS=1
 DO_FIREFOX=1
+DO_PREFS=1
 DO_LAUNCHER=1
 
 for arg in "$@"; do
   case "$arg" in
     --skip-dns)      DO_DNS=0 ;;
     --skip-firefox)  DO_FIREFOX=0 ;;
+    --skip-prefs)    DO_PREFS=0 ;;
     --skip-launcher) DO_LAUNCHER=0 ;;
-    -h|--help)       sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help)       sed -n '2,26p' "$0"; exit 0 ;;
     *) printf 'Unknown option: %s (try --help)\n' "$arg" >&2; exit 2 ;;
   esac
 done
@@ -63,6 +68,21 @@ in_distro_q() {
 in_distro_last() {
   in_distro "$1" | tr -d '\r' | awk 'NF { last = $0 } END { if (last != "") print last }'
 }
+
+# Push a file into the container over stdin-friendly base64, so no host-side
+# rootfs path is needed and no nested quoting can break.
+push_into_distro() {
+  local dest="$1" src="$2" b64
+  b64="$(base64 < "$src" | tr -d '\n')"
+  [ -n "$b64" ] || return 1
+  in_distro_q "mkdir -p \"\$(dirname '$dest')\" && printf '%s' '$b64' | base64 -d > '$dest' && chmod 755 '$dest'"
+}
+
+# Everything Firefox needs under proot: no seccomp sandbox anywhere.
+SANDBOX_ENV="MOZ_DISABLE_CONTENT_SANDBOX=1 MOZ_DISABLE_GMP_SANDBOX=1 \
+MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1 MOZ_DISABLE_RDD_SANDBOX=1 \
+MOZ_DISABLE_GPU_SANDBOX=1 MOZ_CRASHREPORTER_DISABLE=1 LIBGL_ALWAYS_SOFTWARE=1"
+SANDBOX_ENV="$(printf '%s' "$SANDBOX_ENV" | tr -d '\n')"
 
 # Host-side rootfs discovery. Optional: everything works without it, this just
 # avoids one extra `proot-distro login` round trip per operation.
@@ -152,6 +172,20 @@ fix_dns() {
     warn "Still no DNS resolution inside $DISTRO."
     warn "If Termux itself cannot resolve either, check Android Private DNS / VPN."
   fi
+
+  # DNS can work while actual traffic does not (broken IPv6 route), which looks
+  # like "no internet" in the desktop.
+  log "Testing HTTPS egress inside $DISTRO..."
+  if in_distro_q 'command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1'; then
+    if in_distro_q 'if command -v wget >/dev/null 2>&1; then wget -q -O /dev/null -T 15 https://example.com; else curl -fsS -m 15 -o /dev/null https://example.com; fi'; then
+      ok "HTTPS egress works inside $DISTRO"
+    else
+      warn "DNS resolves but HTTPS failed inside $DISTRO (IPv6-only route?)."
+      warn "Compare: proot-distro login $DISTRO -- curl -4 -I https://example.com"
+    fi
+  else
+    log "wget/curl not installed yet; skipping the egress check."
+  fi
 }
 
 if [ "$DO_DNS" = 1 ]; then
@@ -213,16 +247,50 @@ if [ "$DO_FIREFOX" = 1 ]; then
   install_firefox
 fi
 
-# ---------------------------------------------------------------- launcher ---
-# Push a file into the container over stdin-friendly base64, so no host-side
-# rootfs path is needed and no nested quoting can break.
-push_into_distro() {
-  local dest="$1" src="$2" b64
-  b64="$(base64 < "$src" | tr -d '\n')"
-  [ -n "$b64" ] || return 1
-  in_distro_q "mkdir -p \"\$(dirname '$dest')\" && printf '%s' '$b64' | base64 -d > '$dest' && chmod 755 '$dest'"
+# ------------------------------------------------------------------- prefs ---
+# proot cannot start a seccomp sandbox, so the content process dies the moment a
+# tab loads ("Gah. Your tab just crashed."). Level 0 plus in-process tabs keep
+# everything in the single process that proot can actually run.
+write_prefs() {
+  local src n
+  src="$(mktemp)" || die "mktemp failed"
+  cat > "$src" <<'EOF'
+// Installed by fix-termux-ubuntu.sh -- proot-distro cannot start the seccomp
+// sandbox, which makes every tab crash. Do not edit; re-run the script instead.
+user_pref("security.sandbox.content.level", 0);
+user_pref("security.sandbox.gpu.level", 0);
+user_pref("security.sandbox.rdd.level", 0);
+user_pref("security.sandbox.socket.process.level", 0);
+user_pref("browser.tabs.remote.autostart", false);
+user_pref("browser.tabs.remote.autostart.2", false);
+user_pref("browser.tabs.remote.separatePrivilegedContentProcess", false);
+user_pref("fission.autostart", false);
+user_pref("layers.acceleration.disabled", true);
+user_pref("gfx.webrender.all", false);
+user_pref("media.hardware-video-decoding.enabled", false);
+EOF
+
+  log "Writing sandbox prefs into every Firefox profile"
+  if ! push_into_distro /tmp/ff-user.js "$src"; then
+    warn "Could not push user.js into $DISTRO."
+    rm -f "$src"
+    return
+  fi
+  in_distro_q 'for p in "$HOME"/.mozilla/firefox/*/; do [ -d "$p" ] && cp -f /tmp/ff-user.js "$p/user.js"; done; rm -f /tmp/ff-user.js'
+
+  n="$(in_distro_last 'ls -d "$HOME"/.mozilla/firefox/*/ 2>/dev/null | wc -l')"
+  n="${n//[^0-9]/}"
+  if [ -z "$n" ] || [ "$n" = 0 ]; then
+    warn "No Firefox profile yet: launch Firefox once, then re-run:"
+    warn "    bash fix-termux-ubuntu.sh --skip-dns --skip-firefox"
+  else
+    ok "user.js written to $n profile(s)"
+    warn "Quit Firefox completely before starting it again (new prefs load on start)."
+  fi
+  rm -f "$src"
 }
 
+# ---------------------------------------------------------------- launcher ---
 write_launcher() {
   local home desk icon src
 
@@ -248,7 +316,7 @@ Type=Application
 Name=Firefox
 GenericName=Web Browser
 Comment=Browse the Web
-Exec=env MOZ_DISABLE_CONTENT_SANDBOX=1 MOZ_DISABLE_GMP_SANDBOX=1 LIBGL_ALWAYS_SOFTWARE=1 $home/$FF_HOME_DIR/firefox %u
+Exec=env $SANDBOX_ENV $home/$FF_HOME_DIR/firefox %u
 TryExec=$home/$FF_HOME_DIR/firefox
 Icon=$icon
 Terminal=false
@@ -280,6 +348,10 @@ EOF
   rm -f "$src"
 }
 
+if [ "$DO_PREFS" = 1 ]; then
+  write_prefs
+fi
+
 if [ "$DO_LAUNCHER" = 1 ]; then
   write_launcher
 fi
@@ -288,6 +360,7 @@ fi
 echo
 ok "Done. Next steps:"
 printf '  - If the desktop is open, right-click the new Firefox icon -> "Allow launching" (XFCE asks once).\n'
+printf '  - Start Firefox from the icon (not a bare terminal call) so the sandbox-off env vars apply.\n'
 printf '  - Restart the VNC session so menu/icon caches are rebuilt, e.g.:\n'
 printf '        vncserver -kill :1 && vncserver :1 -geometry 1280x720 -depth 24\n'
 printf '  - Sanity check inside the container:  proot-distro login %s -- ping -c2 google.com\n' "$DISTRO"
