@@ -39,7 +39,7 @@ for arg in "$@"; do
     --skip-dns)      DO_DNS=0 ;;
     --skip-firefox)  DO_FIREFOX=0 ;;
     --skip-launcher) DO_LAUNCHER=0 ;;
-    -h|--help)       sed -n '2,21p' "$0"; exit 0 ;;
+    -h|--help)       sed -n '2,24p' "$0"; exit 0 ;;
     *) printf 'Unknown option: %s (try --help)\n' "$arg" >&2; exit 2 ;;
   esac
 done
