@@ -5,15 +5,19 @@
 # Run this inside Termux (NOT inside proot-distro). It is idempotent:
 # safe to re-run any number of times.
 #
-#   1. Writes a working /etc/resolv.conf into the proot rootfs (fixes
+#   1. Writes a working /etc/resolv.conf inside the proot container (fixes
 #      "Could not resolve" / no-internet inside the desktop).
 #   2. Installs the official Mozilla Firefox arm64 (or x86_64) tarball into
 #      /<home>/firefox, because Ubuntu's snap-based firefox cannot work in proot.
 #   3. Regenerates the XFCE launcher (desktop icon + applications menu entry)
 #      pointing at that binary with the sandbox-disabled environment.
 #
+# It works whether or not the rootfs can be found on the host: everything can
+# be done through `proot-distro login`, so proot-distro layout changes
+# (v4 vs v5, containers/ vs installed-rootfs/) do not matter.
+#
 # Usage:
-#   bash fix-termux-ubuntu.sh            # do everything
+#   bash fix-termux-ubuntu.sh
 #   DISTRO=ubuntu bash fix-termux-ubuntu.sh
 #   DNS1=9.9.9.9 DNS2=149.112.112.112 bash fix-termux-ubuntu.sh
 #   bash fix-termux-ubuntu.sh --skip-dns --skip-firefox   # only launcher, etc.
@@ -35,7 +39,7 @@ for arg in "$@"; do
     --skip-dns)      DO_DNS=0 ;;
     --skip-firefox)  DO_FIREFOX=0 ;;
     --skip-launcher) DO_LAUNCHER=0 ;;
-    -h|--help)       sed -n '2,19p' "$0"; exit 0 ;;
+    -h|--help)       sed -n '2,21p' "$0"; exit 0 ;;
     *) printf 'Unknown option: %s (try --help)\n' "$arg" >&2; exit 2 ;;
   esac
 done
@@ -49,50 +53,56 @@ die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 [ -d "$PREFIX" ] || die "This must run inside Termux, not inside proot-distro."
 command -v proot-distro >/dev/null 2>&1 || die "proot-distro missing: pkg install proot-distro"
 
-# proot-distro logs in and prints a banner; keep only the last line of output.
+# proot-distro prints a login banner on stdout; keep only the last real line.
 in_distro() {
-  proot-distro login "$DISTRO" -- bash -lc "$1" 2>&1
+  proot-distro login "$DISTRO" -- /bin/bash -lc "$1" 2>&1
+}
+in_distro_q() {
+  proot-distro login "$DISTRO" -- /bin/bash -lc "$1" >/dev/null 2>&1
 }
 in_distro_last() {
-  # proot-distro's login banner sits on stdout, so keep the last non-empty line.
   in_distro "$1" | tr -d '\r' | awk 'NF { last = $0 } END { if (last != "") print last }'
 }
 
+# Host-side rootfs discovery. Optional: everything works without it, this just
+# avoids one extra `proot-distro login` round trip per operation.
 find_rootfs() {
-  local c
+  local c g
   for c in \
     "$PREFIX/var/lib/proot-distro/installed-rootfs/$DISTRO" \
     "$PREFIX/var/lib/proot-distro/rootfs/$DISTRO" \
+    "$PREFIX/var/lib/proot-distro/containers/$DISTRO/rootfs" \
+    "$PREFIX/var/lib/proot-distro/containers/$DISTRO" \
     "$HOME/$DISTRO-fs" \
     "$HOME/${DISTRO}fs" \
     "$HOME/$DISTRO"; do
-    if [ -d "$c/etc" ] || [ -f "$c/etc/os-release" ]; then
-      printf '%s' "$c"
-      return 0
-    fi
+    [ -d "$c/etc" ] && { printf '%s' "$c"; return 0; }
   done
 
-  # Layout changed between proot-distro releases (and some guides use
-  # ~/ubuntu-fs), so fall back to a bounded search for a directory that
-  # actually looks like a rootfs.
-  local hit
-  hit="$(find "$PREFIX/var/lib/proot-distro" "$HOME" -maxdepth 4 -type d -name "$DISTRO" 2>/dev/null \
-         | while read -r c; do
-             [ -d "$c/etc" ] && { printf '%s\n' "$c"; break; }
+  # Unknown layout: glob one level deep instead of relying on `find`,
+  # which is not part of base Termux.
+  for g in "$PREFIX"/var/lib/proot-distro/*/"$DISTRO" \
+           "$PREFIX"/var/lib/proot-distro/*/"$DISTRO"/rootfs; do
+    [ -d "$g/etc" ] && { printf '%s' "$g"; return 0; }
+  done
+
+  if command -v find >/dev/null 2>&1; then
+    c="$(find "$PREFIX/var/lib/proot-distro" "$HOME" -maxdepth 5 -type d -name "$DISTRO" 2>/dev/null \
+         | while read -r g; do
+             [ -d "$g/etc" ] && { printf '%s\n' "$g"; break; }
            done)"
-  if [ -n "$hit" ]; then
-    printf '%s' "$hit"
-    return 0
+    [ -n "$c" ] && { printf '%s' "$c"; return 0; }
   fi
   return 1
 }
 
-log "Looking for the '$DISTRO' proot rootfs..."
-if ! ROOTFS="$(find_rootfs)"; then
-  warn "Could not find the rootfs on disk; I will rely on 'proot-distro login' instead."
-  ROOTFS=""
-else
+log "Looking for the '$DISTRO' proot rootfs on the host..."
+if ROOTFS="$(find_rootfs)"; then
   ok "Rootfs: $ROOTFS"
+else
+  ROOTFS=""
+  warn "Rootfs path not found on the host (new proot-distro layout?)."
+  warn "That is fine: DNS and the launcher will be written from inside the container."
 fi
 
 proot-distro login "$DISTRO" -- true >/dev/null 2>&1 \
@@ -100,28 +110,38 @@ proot-distro login "$DISTRO" -- true >/dev/null 2>&1 \
 
 # --------------------------------------------------------------------- DNS ---
 fix_dns() {
-  local f="$ROOTFS/etc/resolv.conf"
-  log "Writing DNS ($DNS1, $DNS2) to $f"
+  local wrote=0 f
 
-  if [ ! -d "$ROOTFS/etc" ]; then
-    warn "No $ROOTFS/etc — skipping direct write; fixing from inside instead."
-    in_distro "printf 'nameserver $DNS1\nnameserver $DNS2\n' > /etc/resolv.conf && cat /etc/resolv.conf"
-    return $?
+  if [ -n "$ROOTFS" ]; then
+    f="$ROOTFS/etc/resolv.conf"
+    log "Writing DNS ($DNS1, $DNS2) to $f"
+    # A symlink to /run/systemd/resolve/stub-resolv.conf (127.0.0.53) never
+    # works under proot: systemd-resolved is not running there.
+    [ -L "$f" ] && warn "resolv.conf was a symlink -> $(readlink "$f" 2>/dev/null); replacing it."
+    rm -f "$f" 2>/dev/null
+    if printf 'nameserver %s\nnameserver %s\n' "$DNS1" "$DNS2" > "$f" 2>/dev/null; then
+      wrote=1
+      ok "resolv.conf written (host side)"
+    else
+      warn "Could not write $f from the host; falling back to the inside path."
+    fi
   fi
 
-  # A symlink to /run/systemd/resolve/stub-resolv.conf (127.0.0.53) never works
-  # under proot because systemd-resolved is not running there.
-  if [ -L "$f" ]; then
-    warn "resolv.conf was a symlink -> $(readlink "$f" 2>/dev/null); replacing it with a real file."
+  if [ "$wrote" = 0 ]; then
+    log "Writing DNS ($DNS1, $DNS2) from inside $DISTRO"
+    if in_distro_q "rm -f /etc/resolv.conf && printf 'nameserver $DNS1\nnameserver $DNS2\n' > /etc/resolv.conf"; then
+      wrote=1
+      ok "resolv.conf written (inside container)"
+    else
+      warn "/etc/resolv.conf is not writable inside $DISTRO (bind-mounted read-only?)."
+      warn "The desktop will keep using whatever DNS the host provides."
+    fi
   fi
-  rm -f "$f" 2>/dev/null
 
-  if printf 'nameserver %s\nnameserver %s\n' "$DNS1" "$DNS2" > "$f" 2>/dev/null; then
-    ok "resolv.conf written"
-  else
-    warn "Cannot write $f; fixing from inside the container instead."
-    in_distro "rm -f /etc/resolv.conf && printf 'nameserver $DNS1\nnameserver $DNS2\n' > /etc/resolv.conf"
-  fi
+  echo "--- /etc/resolv.conf inside $DISTRO ---"
+  # Drop proot-distro's login banner so only the real file is shown.
+  in_distro 'cat /etc/resolv.conf 2>/dev/null || echo "<missing>"' \
+    | tr -d '\r' | grep -v -e '^Welcome to ' -e '^$' || true
 
   log "Testing DNS inside $DISTRO..."
   local hosts
@@ -130,18 +150,18 @@ fix_dns() {
     ok "DNS works inside $DISTRO: $hosts"
   else
     warn "Still no DNS resolution inside $DISTRO."
-    warn "If Termux itself cannot resolve either, check Android Private DNS / VPN, then re-run."
+    warn "If Termux itself cannot resolve either, check Android Private DNS / VPN."
   fi
 }
 
 if [ "$DO_DNS" = 1 ]; then
-  [ -n "$ROOTFS" ] || die "DNS fix needs the rootfs path, which was not found. Run: proot-distro list"
   fix_dns
 fi
 
 # ----------------------------------------------------------------- Firefox ---
 install_firefox() {
   local home arch url pkg missing=()
+  local ffbin
 
   home="$(in_distro_last 'printf %s "$HOME"')"
   [ -n "$home" ] || home="/root"
@@ -154,39 +174,38 @@ install_firefox() {
   esac
 
   log "Installing Firefox for $arch into $home/$FF_HOME_DIR"
-  in_distro 'apt-get update -qq' >/dev/null 2>&1 || warn "apt-get update failed (DNS not fixed? continuing anyway)"
+  in_distro_q 'apt-get update -qq' || warn "apt-get update failed (DNS not fixed yet? continuing anyway)"
 
   # Package names differ between Ubuntu releases (libasound2 vs libasound2t64),
-  # so try each one and only report the ones that are truly unavailable.
+  # so try each and only report what is truly unavailable.
   for pkg in ca-certificates wget xz-utils \
              libgtk-3-0t64 libgtk-3-0 libdbus-glib-1-2 \
              libasound2t64 libasound2 libxt6 libx11-xcb1 libxcomposite1 \
              libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
              fonts-liberation; do
-    in_distro "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $pkg" \
-      >/dev/null 2>&1 || missing+=("$pkg")
+    in_distro_q "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $pkg" \
+      || missing+=("$pkg")
   done
-  [ ${#missing[@]} -eq 0 ] || log "Not available on this Ubuntu release (fine): ${missing[*]}"
+  [ ${#missing[@]} -eq 0 ] || log "Not available on this release (fine): ${missing[*]}"
 
   log "Downloading Firefox (~90 MB, this can take a few minutes)..."
-  if ! in_distro "wget -q -O /tmp/firefox.tar.xz '$url' || curl -fsSL -o /tmp/firefox.tar.xz '$url'" >/dev/null 2>&1; then
-    die "Firefox download failed. Check Termux connectivity, then re-run."
+  if ! in_distro_q "wget -q -O /tmp/firefox.tar.xz '$url' || curl -fsSL -o /tmp/firefox.tar.xz '$url'"; then
+    die "Firefox download failed. Check connectivity, then re-run."
   fi
   ok "Download complete"
 
   log "Extracting to $home/$FF_HOME_DIR (replacing any previous copy)..."
-  if ! in_distro "rm -rf '$home/$FF_HOME_DIR' && tar -xf /tmp/firefox.tar.xz -C '$home' && rm -f /tmp/firefox.tar.xz" >/dev/null 2>&1; then
+  if ! in_distro_q "rm -rf '$home/$FF_HOME_DIR' && tar -xf /tmp/firefox.tar.xz -C '$home' && rm -f /tmp/firefox.tar.xz"; then
     die "Extracting the Firefox tarball failed (out of space? need ~400 MB free)."
   fi
   ok "Extracted"
 
   log "Checking the binary runs..."
-  local ver
-  ver="$(in_distro_last "'$home/$FF_HOME_DIR/firefox' --version 2>&1")"
-  case "$ver" in
-    Mozilla*) ok "$ver" ;;
-    *) warn "Firefox did not report a version: ${ver:-<no output>}"
-       warn "Usually a missing shared library. Run: ldd $home/$FF_HOME_DIR/firefox | grep 'not found'" ;;
+  ffbin="$(in_distro_last "'$home/$FF_HOME_DIR/firefox' --version 2>&1")"
+  case "$ffbin" in
+    Mozilla*) ok "$ffbin" ;;
+    *) warn "Firefox did not report a version: ${ffbin:-<no output>}"
+       warn "Usually a missing library. Run: ldd $home/$FF_HOME_DIR/firefox | grep 'not found'" ;;
   esac
 }
 
@@ -195,8 +214,18 @@ if [ "$DO_FIREFOX" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------- launcher ---
+# Push a file into the container over stdin-friendly base64, so no host-side
+# rootfs path is needed and no nested quoting can break.
+push_into_distro() {
+  local dest="$1" src="$2" b64
+  b64="$(base64 < "$src" | tr -d '\n')"
+  [ -n "$b64" ] || return 1
+  in_distro_q "mkdir -p \"\$(dirname '$dest')\" && printf '%s' '$b64' | base64 -d > '$dest' && chmod 755 '$dest'"
+}
+
 write_launcher() {
-  local home desk src
+  local home desk icon src
+
   home="$(in_distro_last 'printf %s "$HOME"')"
   [ -n "$home" ] || home="/root"
   desk="$(in_distro_last 'command -v xdg-user-dir >/dev/null 2>&1 && xdg-user-dir DESKTOP || printf %s "$HOME/Desktop"')"
@@ -204,9 +233,8 @@ write_launcher() {
 
   log "Writing XFCE launchers (desktop: $desk)"
 
-  # Decide the icon before writing the file: the tarball ships it inside
-  # browser/chrome/icons/default/, but older builds may not.
-  local icon="$home/$FF_HOME_DIR/browser/chrome/icons/default/default128.png"
+  # Decide the icon before writing the file; older builds may lack it.
+  icon="$home/$FF_HOME_DIR/browser/chrome/icons/default/default128.png"
   if [ -n "$ROOTFS" ] && [ ! -f "$ROOTFS$icon" ]; then
     warn "Icon file missing; the launcher will use the theme's generic icon."
     icon="firefox"
@@ -231,19 +259,25 @@ StartupWMClass=firefox
 EOF
 
   if [ -n "$ROOTFS" ]; then
-    # Direct write into the rootfs: no nested-quoting games, works even when
-    # the container is not logged in.
     mkdir -p "$ROOTFS$desk" "$ROOTFS$home/.local/share/applications" 2>/dev/null
-    install -m 755 "$src" "$ROOTFS$desk/firefox.desktop" 2>/dev/null \
-      && ok "Wrote $desk/firefox.desktop"
-    install -m 755 "$src" "$ROOTFS$home/.local/share/applications/firefox.desktop" 2>/dev/null \
-      && ok "Wrote $home/.local/share/applications/firefox.desktop"
-    rm -f "$src"
-  else
-    warn "Rootfs path unknown; copy the desktop entry in from inside the container."
-    cp "$src" "$HOME/firefox.desktop" && ok "Wrote $HOME/firefox.desktop — copy it to $desk inside proot"
-    rm -f "$src"
+    if install -m 755 "$src" "$ROOTFS$desk/firefox.desktop" 2>/dev/null; then
+      ok "Wrote $desk/firefox.desktop"
+      install -m 755 "$src" "$ROOTFS$home/.local/share/applications/firefox.desktop" 2>/dev/null \
+        && ok "Wrote $home/.local/share/applications/firefox.desktop"
+      rm -f "$src"
+      return 0
+    fi
+    warn "Host-side write failed; pushing the launcher from inside instead."
   fi
+
+  if push_into_distro "$desk/firefox.desktop" "$src"; then
+    ok "Wrote $desk/firefox.desktop"
+    push_into_distro "$home/.local/share/applications/firefox.desktop" "$src" \
+      && ok "Wrote $home/.local/share/applications/firefox.desktop"
+  else
+    warn "Could not write the launcher into $DISTRO."
+  fi
+  rm -f "$src"
 }
 
 if [ "$DO_LAUNCHER" = 1 ]; then
@@ -253,7 +287,7 @@ fi
 # ------------------------------------------------------------------ summary --
 echo
 ok "Done. Next steps:"
-printf '  - If the desktop is already open, right-click the new Firefox icon -> "Allow launching" (XFCE asks once).\n'
-printf '  - Restart the VNC session so the menu/icon cache is rebuilt:\n'
+printf '  - If the desktop is open, right-click the new Firefox icon -> "Allow launching" (XFCE asks once).\n'
+printf '  - Restart the VNC session so menu/icon caches are rebuilt, e.g.:\n'
 printf '        vncserver -kill :1 && vncserver :1 -geometry 1280x720 -depth 24\n'
 printf '  - Sanity check inside the container:  proot-distro login %s -- ping -c2 google.com\n' "$DISTRO"
